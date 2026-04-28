@@ -1,0 +1,251 @@
+================================================================================
+  CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. AUTHENTICATION & RBAC FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Authentication uses stateless JWT (JSON Web Tokens):
+
+  Client → POST /api/auth/login (email + password)
+         → Server validates, bcrypt.compare()
+         → Issues JWT { id, email, role, exp }
+         → Client stores JWT, sends as "Authorization: Bearer <token>"
+
+RBAC is enforced via two middleware layers:
+  1. authenticate()  — verifies JWT, loads user from DB, attaches to req.user
+  2. authorize(role) — checks req.user.role against allowed roles
+
+Role matrix:
+  ┌─────────────────────────────────┬───────────┬─────────┐
+  │ Action                          │ Principal │ Teacher │
+  ├─────────────────────────────────┼───────────┼─────────┤
+  │ Register/Login                  │     ✓     │    ✓    │
+  │ Upload content                  │     ✗     │    ✓    │
+  │ View own content                │     ✗     │    ✓    │
+  │ View ALL content                │     ✓     │    ✗    │
+  │ Approve/Reject content          │     ✓     │    ✗    │
+  │ Delete any content              │     ✓     │    ✗    │
+  │ Delete own content              │     ✗     │    ✓    │
+  │ View analytics                  │     ✓     │ Own only│
+  │ View users list                 │     ✓     │    ✗    │
+  └─────────────────────────────────┴───────────┴─────────┘
+
+Public routes (no JWT required):
+  - GET /content/live/:teacherId   — students poll this
+  - GET /health
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SUBJECT-BASED SYSTEM DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each teacher has independent subject "slots" (content_slots table):
+  Teacher A → Maths slot, Science slot
+  Teacher B → Maths slot (independent from Teacher A's Maths)
+
+Content is assigned to a slot via content_schedule (rotation_order + duration).
+
+The public API supports:
+  GET /content/live/:teacherId          → returns active content per subject (all)
+  GET /content/live/:teacherId?subject=maths → returns active Maths content only
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. UPLOAD HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Multer handles multipart/form-data
+  - File filter checks MIME type (image/jpeg, image/png, image/gif)
+  - Max file size: 10MB (configurable via MAX_FILE_SIZE env)
+  - Files stored at: src/uploads/YYYY-MM/<uuid>.<ext>
+  - File URL served as static files via Express
+  - On content deletion, the physical file is removed from disk
+  - S3 bonus: replace diskStorage with multer-s3 and update getFileUrl()
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. APPROVAL WORKFLOW DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Content Lifecycle:
+    uploaded → pending → approved
+                      ↘ rejected (with reason)
+
+  State transitions:
+    Teacher uploads → status = 'pending' (auto)
+    Principal approves → status = 'approved', approved_by set, approved_at = NOW()
+    Principal rejects → status = 'rejected', rejection_reason stored
+
+  Business rules:
+    - Only principal can approve/reject
+    - Rejection reason is mandatory
+    - Approved content still won't show unless within time window
+    - Re-approval of rejected content is not supported (create new upload)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SCHEDULING / ROTATION LOGIC (CORE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is the most critical part of the system. The algorithm is:
+
+  STATELESS TIME-BASED ROTATION (no DB writes on each request):
+
+  1. Fetch all content for a teacher that is:
+       - status = 'approved'
+       - start_time IS NOT NULL AND end_time IS NOT NULL
+       - NOW() BETWEEN start_time AND end_time
+
+  2. Group items by subject.
+
+  3. For each subject group:
+       a. Sort items by rotation_order ASC
+       b. Calculate totalCycleSeconds = SUM(duration * 60)
+       c. positionInCycle = (Math.floor(Date.now() / 1000)) % totalCycleSeconds
+       d. Walk items, subtract each item's duration from position
+          until position < item.duration → that item is ACTIVE
+
+  Example:
+    Maths slot: [A(5min), B(5min), C(5min)] → total = 15 min = 900s
+    If epoch=1000s → 1000 % 900 = 100s → item A is active (0-300s)
+    If epoch=1400s → 1400 % 900 = 500s → item B is active (300-600s)
+    If epoch=1700s → 1700 % 900 = 800s → item C is active (600-900s)
+    If epoch=1900s → 1900 % 900 = 100s → loops back to A
+
+  Edge cases handled:
+    - No approved content → "No content available"
+    - Content approved but outside time window → not included → empty
+    - Invalid subject filter → empty response (not error)
+    - Single item in rotation → always that item
+
+  Cache: Live results cached in Redis for 15 seconds (short TTL so rotation
+         changes are reflected quickly without hammering the DB).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. DATABASE DESIGN DECISIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Tables:
+    users             — principals and teachers, role-based
+    content           — all uploaded content with lifecycle status
+    content_slots     — (teacher_id, subject) pairs; one slot per subject/teacher
+    content_schedule  — joins content to slot with rotation_order + duration
+    content_analytics — daily view counts per content item for analytics
+
+  Key decisions:
+    - UUID primary keys (v4) for all tables → avoids enumeration attacks
+    - content_slots has UNIQUE(teacher_id, subject) → enforced deduplication
+    - content_schedule has UNIQUE(content_id, slot_id) → one schedule per item
+    - content.start_time/end_time on content itself → simple range query
+    - Analytics uses upsert (INSERT ... ON DUPLICATE KEY UPDATE) on (content_id, date)
+      → daily granularity, no overcounting
+    - Soft deletion not used (hard delete with file cleanup is simpler here)
+
+  Indexes:
+    - content: (status), (subject), (uploaded_by), (start_time, end_time)
+    - content_analytics: (subject, access_date), (teacher_id, access_date)
+    - users: (email), (role)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. FOLDER STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  src/
+  ├── app.js                    # Express bootstrap, middleware setup
+  ├── config/
+  │   ├── database.js           # MySQL pool + query helpers
+  │   └── redis.js              # Redis client + safe cache helpers
+  ├── controllers/              # HTTP layer: parse request → call service → respond
+  │   ├── auth.controller.js
+  │   ├── content.controller.js
+  │   ├── broadcast.controller.js
+  │   ├── analytics.controller.js
+  │   └── user.controller.js
+  ├── services/                 # Business logic layer
+  │   ├── auth.service.js
+  │   ├── content.service.js
+  │   ├── scheduling.service.js # Core rotation algorithm lives here
+  │   └── analytics.service.js
+  ├── models/                   # Data access layer (raw SQL)
+  │   ├── user.model.js
+  │   ├── content.model.js
+  │   ├── contentSlot.model.js
+  │   ├── contentSchedule.model.js
+  │   └── analytics.model.js
+  ├── middlewares/
+  │   ├── auth.middleware.js    # JWT verify + RBAC
+  │   ├── upload.middleware.js  # Multer config
+  │   ├── cache.middleware.js   # Route-level Redis caching
+  │   └── validate.middleware.js
+  ├── routes/
+  │   ├── index.js              # Aggregates /api routes
+  │   ├── auth.routes.js
+  │   ├── content.routes.js
+  │   ├── broadcast.routes.js   # Public routes
+  │   ├── analytics.routes.js
+  │   └── user.routes.js
+  ├── utils/
+  │   ├── logger.js             # Winston
+  │   ├── response.js           # Standardized JSON responses
+  │   ├── migrate.js            # DB migrations
+  │   └── seed.js               # Dev seed data
+  └── uploads/                  # Local file storage (YYYY-MM/<uuid>.ext)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. MIDDLEWARE USAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  helmet()          → HTTP security headers
+  cors()            → Cross-Origin control
+  compression()     → gzip responses
+  morgan()          → HTTP access logging → Winston
+  rateLimit()       → DOS protection (100 req/15min for API, 300/min for live)
+  authenticate()    → JWT verification + user hydration
+  authorize(role)   → RBAC gate
+  upload.single()   → Multer file parsing
+  handleUploadError → Multer error → JSON response
+  validate()        → express-validator result check
+  cacheMiddleware() → Route-level Redis GET cache with auto-invalidation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. REDIS CACHING STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Cache key patterns:
+    live:<teacherId>:<subject|all>     TTL: 15s  (rotation changes every ~seconds)
+    route:/api/content?...             TTL: 30s  (content list)
+    route:/api/content/pending         TTL: 20s  (pending list)
+    analytics:active-subjects:<days>   TTL: 120s
+    analytics:content-usage:<days>     TTL: 120s
+    analytics:teacher:<id>:<days>      TTL: 120s
+    analytics:summary                  TTL: 60s
+
+  Invalidation strategy (cache busting on mutation):
+    - Content upload/approve/reject/delete → cacheDelPattern('route:/api/content*')
+                                           → cacheDelPattern('live:*')
+    - Analytics view tracked              → cacheDelPattern('analytics:*')
+
+  Fault tolerance:
+    - Redis client uses lazyConnect + retryStrategy(max 3 retries)
+    - All cache operations are wrapped in try/catch
+    - On Redis failure, system falls through to DB queries silently
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. SCALABILITY APPROACH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Current:
+    - Connection pool (mysql2 pool, limit=10)
+    - Redis caching reduces DB load on hot paths (live broadcast)
+    - Stateless JWT → horizontal scaling of app servers is safe
+    - Stateless rotation algorithm → no coordination between instances needed
+
+  To scale further:
+    - Use Redis Cluster or Upstash for distributed cache
+    - Move file storage to S3 (replace diskStorage in upload.middleware.js)
+    - Add a message queue (BullMQ/Redis) for approval notification emails
+    - Add CDN in front of uploaded content
+    - Read replicas for analytics queries
+    - Separate analytics write path to async queue (avoid blocking live requests)
+    - Rate limiting backed by Redis (express-rate-limit + redis store)
+    - PM2 cluster mode or container orchestration (K8s) for multi-instance
+
+================================================================================
